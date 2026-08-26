@@ -29,9 +29,7 @@ Cómo correrlo en Google Colab:
 """
 
 import io
-import re
 from datetime import date
-from xml.sax.saxutils import escape as _xml_escape
 
 import numpy as np
 import pandas as pd
@@ -272,26 +270,6 @@ footer {{ visibility: hidden; }}
 # porque usa el consumo real registrado en la bitácora.
 # ============================================================
 CO2_KG_POR_GALON = 8.887
-
-# ============================================================
-# CONFIGURACIÓN DE IA (GROQ)
-# El token se lee primero de st.secrets / variable de entorno
-# GROQ_API_KEY (recomendado, sobre todo si el repo va a ser
-# público en GitHub) y solo si no existe ninguna de las dos
-# se usa el valor por defecto embebido aquí.
-# ============================================================
-import os
-
-GROQ_MODEL = "openai/gpt-oss-120b"
-try:
-    _groq_key_from_secrets = st.secrets.get("GROQ_API_KEY")
-except Exception:
-    _groq_key_from_secrets = None
-GROQ_API_KEY = (
-    _groq_key_from_secrets
-    or os.environ.get("GROQ_API_KEY")
-    or "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"
-)
 
 
 # ============================================================
@@ -545,133 +523,6 @@ def chart_panel_open(title, subtitle):
 def chart_panel_close():
     st.markdown("</div>", unsafe_allow_html=True)
 
-def build_fleet_summary_text() -> str:
-    """Arma un resumen en texto plano de los datos filtrados actuales,
-    que se envía como contexto al modelo de IA."""
-    lines = []
-    lines.append(f"Periodo analizado: {date_start} a {date_end}")
-    lines.append(f"Vehículos incluidos ({n_vehicles}): {', '.join(selected_placas)}")
-    lines.append("")
-    lines.append("KPIs generales del periodo filtrado:")
-    lines.append(f"- Kilometraje total: {nf0(total_km)} km")
-    lines.append(f"- Combustible total consumido: {nf1(total_comb)} gal")
-    lines.append(f"- Eficiencia promedio: {nf1(efficiency)} km/gal")
-    lines.append(f"- Excesos de velocidad totales: {nf0(total_exceso)}")
-    lines.append(f"- Estacionamientos totales: {nf0(total_estac)}")
-    lines.append(f"- CO2 emitido total: {nf1(total_co2_kg)} kg")
-    lines.append(f"- Intensidad de emisiones promedio: {nf0(co2_intensity)} g CO2/km")
-    lines.append("")
-    lines.append("Aspectos destacados:")
-    lines.append(f"- Mayor recorrido: {highlight_km['placa']} con {nf0(highlight_km['km'])} km")
-    lines.append(f"- Más excesos de velocidad: {highlight_exceso['placa']} con "
-                 f"{nf0(highlight_exceso['diasConExceso'])} días")
-    if highlight_eff is not None:
-        lines.append(f"- Mejor eficiencia: {highlight_eff['placa']} con "
-                     f"{nf1(highlight_eff['eficiencia'])} km/gal")
-    lines.append(f"- Día de mayor actividad: "
-                 f"{pd.to_datetime(highlight_day['fecha']).strftime('%d/%m/%Y')} "
-                 f"con {nf0(highlight_day['km'])} km")
-    lines.append("")
-    lines.append("Detalle por vehículo (placa | km | combustible gal | eficiencia km/gal | "
-                 "días con exceso | estacionamientos | CO2 kg):")
-    for _, row in per_vehicle.sort_values("km", ascending=False).iterrows():
-        lines.append(
-            f"- {row['placa']} | {nf0(row['km'])} km | {nf1(row['comb'])} gal | "
-            f"{nf1(row['eficiencia'])} km/gal | {int(row['diasConExceso'])} días | "
-            f"{nf0(row['estac'])} paradas | {nf1(row['co2_kg'])} kg CO2"
-        )
-    return "\n".join(lines)
-
-
-def call_groq_analysis(data_summary: str) -> str:
-    """Envía el resumen de datos a Groq y devuelve el análisis en texto/markdown."""
-    from groq import Groq
-
-    client = Groq(api_key=GROQ_API_KEY)
-    system_prompt = (
-        "Eres un analista experto en gestión de flotas vehiculares y en el Plan Estratégico "
-        "de Seguridad Vial (PESV) en Colombia. Recibes datos agregados y reales de una bitácora "
-        "de flota (no debes inventar cifras adicionales) y debes producir un análisis profesional "
-        "en español, claro y accionable, en formato markdown, organizado en estas secciones:\n"
-        "1. Resumen ejecutivo\n"
-        "2. Hallazgos sobre recorrido y eficiencia de combustible\n"
-        "3. Riesgos de seguridad vial (excesos de velocidad)\n"
-        "4. Huella de carbono\n"
-        "5. Recomendaciones concretas y priorizadas\n"
-        "Usa únicamente las cifras que se te entregan a continuación."
-    )
-    resp = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Datos agregados de la flota:\n\n{data_summary}\n\n"
-                                        "Genera el análisis completo."},
-        ],
-        temperature=0.4,
-        max_tokens=2200,
-    )
-    return resp.choices[0].message.content
-
-
-def _md_line_to_reportlab(line: str) -> str:
-    """Escapa XML y convierte negrita markdown (**texto**) y viñetas (- ) a
-    marcado simple compatible con reportlab Paragraph."""
-    escaped = _xml_escape(line)
-    escaped = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
-    escaped = re.sub(r"^-\s+", "• ", escaped)
-    escaped = re.sub(r"^\d+\.\s+", lambda m: m.group(0), escaped)
-    return escaped
-
-
-def build_analysis_pdf(analysis_text: str, source_label: str, d_start, d_end) -> bytes:
-    """Genera un PDF descargable con el análisis producido por la IA."""
-    from reportlab.lib.pagesizes import letter
-    from reportlab.lib.units import cm
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(
-        buffer, pagesize=letter,
-        leftMargin=2 * cm, rightMargin=2 * cm, topMargin=2 * cm, bottomMargin=2 * cm,
-        title="Análisis de Flota Vehicular - IA",
-    )
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle("TituloPersonalizado", parent=styles["Title"], fontSize=18, spaceAfter=6)
-    meta_style = ParagraphStyle("Meta", parent=styles["Normal"], textColor=colors.grey,
-                                 fontSize=9, spaceAfter=16, leading=13)
-    h_style = ParagraphStyle("Encabezado", parent=styles["Heading2"], spaceBefore=14, spaceAfter=6)
-    body_style = ParagraphStyle("Cuerpo", parent=styles["Normal"], fontSize=10.5, leading=15, spaceAfter=7)
-
-    story = [
-        Paragraph("Análisis Integral de la Flota Vehicular – Generado por IA", title_style),
-        Paragraph(
-            f"Fuente de datos: {_xml_escape(source_label)}  ·  Periodo: {d_start} a {d_end}  ·  "
-            f"Modelo: {GROQ_MODEL}  ·  Generado el: {date.today().isoformat()}",
-            meta_style,
-        ),
-    ]
-
-    for raw_line in analysis_text.split("\n"):
-        block = raw_line.strip()
-        if not block:
-            story.append(Spacer(1, 6))
-            continue
-        if block.startswith("### "):
-            story.append(Paragraph(_xml_escape(block[4:]), h_style))
-        elif block.startswith("## "):
-            story.append(Paragraph(_xml_escape(block[3:]), h_style))
-        elif block.startswith("# "):
-            story.append(Paragraph(_xml_escape(block[2:]), h_style))
-        else:
-            story.append(Paragraph(_md_line_to_reportlab(block), body_style))
-
-    doc.build(story)
-    buffer.seek(0)
-    return buffer.getvalue()
-
-
 def base_layout(fig, height=300):
     fig.update_layout(
         height=height,
@@ -888,72 +739,6 @@ with col_h:
     base_layout(fig, 280)
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
     chart_panel_close()
-
-chart_panel_open("Intensidad de emisiones por vehículo", "Gramos de CO₂ por kilómetro recorrido — a menor valor, más eficiente/limpio")
-fig = go.Figure(go.Bar(
-    x=per_vehicle.sort_values("co2_g_por_km")["placa"],
-    y=per_vehicle.sort_values("co2_g_por_km")["co2_g_por_km"],
-    marker_color=C["purple"], marker=dict(cornerradius=4),
-    hovertemplate="%{y:.0f} g CO₂/km<extra></extra>",
-))
-base_layout(fig, 260)
-fig.update_xaxes(tickangle=-45)
-st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-chart_panel_close()
-
-# ============================================================
-# SECCIÓN NUEVA: ANÁLISIS CON IA (GROQ)
-# ============================================================
-section_header("🤖 Análisis con IA", C["cyan"])
-
-st.markdown(f"""
-<div style="font-size:11.5px; color:{C['muted']}; margin:0 0 12px 0; line-height:1.5;">
-Genera un análisis narrativo de los datos filtrados (KPIs, seguridad vial, eficiencia y huella de
-carbono) usando IA — modelo <b>{GROQ_MODEL}</b> vía Groq. Luego puedes descargarlo como PDF.
-</div>
-""", unsafe_allow_html=True)
-
-ai_col1, ai_col2 = st.columns([1, 3])
-with ai_col1:
-    generar_analisis = st.button("✨ Generar análisis con IA", use_container_width=True)
-
-if generar_analisis:
-    with st.spinner("Analizando datos de la flota con IA..."):
-        try:
-            resumen_datos = build_fleet_summary_text()
-            texto_analisis = call_groq_analysis(resumen_datos)
-            st.session_state["ai_analysis_text"] = texto_analisis
-            st.session_state["ai_analysis_source"] = source_label
-            st.session_state["ai_analysis_period"] = (date_start, date_end)
-        except Exception as e:
-            st.error(f"No se pudo generar el análisis con IA: {e}")
-
-if st.session_state.get("ai_analysis_text"):
-    chart_panel_open(
-        "Análisis generado por IA",
-        f"Modelo: {GROQ_MODEL} · Fuente: {st.session_state.get('ai_analysis_source', source_label)}",
-    )
-    st.markdown(st.session_state["ai_analysis_text"])
-    chart_panel_close()
-
-    try:
-        _period = st.session_state.get("ai_analysis_period", (date_start, date_end))
-        pdf_bytes = build_analysis_pdf(
-            st.session_state["ai_analysis_text"],
-            st.session_state.get("ai_analysis_source", source_label),
-            _period[0], _period[1],
-        )
-        st.download_button(
-            "⬇️ Descargar análisis en PDF",
-            data=pdf_bytes,
-            file_name=f"analisis_ia_flota_{date.today().isoformat()}.pdf",
-            mime="application/pdf",
-            use_container_width=False,
-        )
-    except Exception as e:
-        st.error(f"No se pudo generar el PDF: {e}")
-
-st.markdown("<div style='height:20px'></div>", unsafe_allow_html=True)
 
 # ============================================================
 # FOOTER

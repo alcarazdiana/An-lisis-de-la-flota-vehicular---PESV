@@ -696,32 +696,25 @@ def _es_separador_tabla(linea: str) -> bool:
     return bool(_TABLE_SEP_RE.match(linea.strip()))
 
 
-def _wrap_lines(pdf: "FPDF", width: float, line_h: float, texto: str):
-    """Devuelve las líneas en que se partiría 'texto' dentro de un ancho
-    dado, sin dibujar nada (para calcular la altura de fila antes de
-    pintarla). Compatible con varias versiones de fpdf2."""
-    texto = texto if texto else ""
-    try:
-        lineas = pdf.multi_cell(width, line_h, texto, dry_run=True, output="LINES")
-        if lineas:
-            return lineas
-    except TypeError:
-        pass
-    try:
-        lineas = pdf.multi_cell(width, line_h, texto, split_only=True)
-        if lineas:
-            return lineas
-    except TypeError:
-        pass
-    # Fallback simple si ninguna de las dos APIs anteriores está disponible
-    aprox_chars = max(1, int(width / 1.8))
-    if len(texto) <= aprox_chars:
-        return [texto]
+def _wrap_lines(pdf: "FPDF", width: float, texto: str):
+    """Parte 'texto' en líneas que quepan dentro de 'width', usando
+    únicamente medición de ancho (pdf.get_string_width), sin llamar a
+    multi_cell/dry_run — así se evita por completo la excepción de
+    fpdf2 'Not enough horizontal space to render a single character'."""
+    texto = (texto or "").strip()
+    if not texto:
+        return [""]
+
+    ancho_disponible = max(width, 4.0)
     palabras = texto.split(" ")
     lineas, actual = [], ""
     for palabra in palabras:
         candidata = (actual + " " + palabra).strip()
-        if len(candidata) > aprox_chars and actual:
+        try:
+            ancho_candidata = pdf.get_string_width(candidata)
+        except Exception:
+            ancho_candidata = len(candidata) * 1.9  # estimación de respaldo
+        if ancho_candidata > ancho_disponible and actual:
             lineas.append(actual)
             actual = palabra
         else:
@@ -733,9 +726,11 @@ def _wrap_lines(pdf: "FPDF", width: float, line_h: float, texto: str):
 
 def _render_tabla_pdf(pdf: "FPDF", filas: list):
     """Dibuja una tabla markdown ya parseada como un grid manual (anchos
-    de columna fijos, calculados por nosotros), evitando el algoritmo
-    automático de fpdf2 que puede fallar con 'Not enough horizontal
-    space' cuando hay muchas columnas o texto largo sin espacios."""
+    de columna fijos, calculados por nosotros, y texto pre-partido en
+    líneas dibujado con cell()). Evita por completo pdf.table() y
+    multi_cell() para el contenido de las celdas, que son las rutas que
+    pueden disparar 'Not enough horizontal space to render a single
+    character' en fpdf2 cuando hay muchas columnas o texto largo."""
     if not filas:
         return
 
@@ -745,9 +740,10 @@ def _render_tabla_pdf(pdf: "FPDF", filas: list):
     filas = [f + [""] * (n_cols - len(f)) for f in filas]
     filas = [[_pdf_sanitize(c) for c in f] for f in filas]
 
-    # Máximo de columnas soportadas cómodamente en A4; si el modelo
-    # devolvió más, se fusionan las columnas sobrantes en la última.
-    MAX_COLS = 5
+    usable_width = pdf.w - pdf.l_margin - pdf.r_margin
+    # Máximo de columnas de forma que cada una tenga al menos ~15mm;
+    # si el modelo devolvió más columnas, se fusionan las sobrantes.
+    MAX_COLS = max(2, min(5, int(usable_width // 15)))
     if n_cols > MAX_COLS:
         nuevas_filas = []
         for f in filas:
@@ -757,11 +753,11 @@ def _render_tabla_pdf(pdf: "FPDF", filas: list):
         filas = nuevas_filas
         n_cols = MAX_COLS
 
-    usable_width = pdf.w - pdf.l_margin - pdf.r_margin
     col_width = usable_width / n_cols
     line_h = 5.0
-    font_size = 9.0 if col_width >= 22 else 7.5
-    padding = 1.2
+    padding = 1.3
+    font_size = 9.0
+    texto_width = max(col_width - 2 * padding, 5.0)
 
     pdf.ln(1)
     for idx, fila in enumerate(filas):
@@ -774,29 +770,42 @@ def _render_tabla_pdf(pdf: "FPDF", filas: list):
         else:
             pdf.set_fill_color(255, 255, 255)
 
-        # Altura necesaria para la fila (según la celda que más se ajuste)
-        alturas = []
-        for texto in fila:
-            lineas_wrap = _wrap_lines(pdf, col_width - 2 * padding, line_h, texto)
-            alturas.append(max(1, len(lineas_wrap)))
-        row_h = max(alturas) * line_h + 2 * padding
+        # Pre-partimos cada celda en líneas (para la altura de fila y
+        # para dibujarlas después, sin volver a calcular el wrap).
+        celdas_wrap = [_wrap_lines(pdf, texto_width, texto) for texto in fila]
+        n_lineas_fila = max(1, max(len(w) for w in celdas_wrap))
+        row_h = n_lineas_fila * line_h + 2 * padding
 
         # Salto de página manual si la fila no cabe en el espacio restante
         if pdf.get_y() + row_h > pdf.page_break_trigger:
             pdf.add_page()
+            pdf.set_font("Helvetica", "B" if es_encabezado else "", font_size)
 
         x_start = pdf.l_margin
         y_start = pdf.get_y()
 
-        for c_idx, texto in enumerate(fila):
+        for c_idx, lineas_celda in enumerate(celdas_wrap):
             x = x_start + c_idx * col_width
             pdf.rect(x, y_start, col_width, row_h, style="DF")
-            pdf.set_xy(x + padding, y_start + padding)
-            pdf.multi_cell(col_width - 2 * padding, line_h, texto, border=0, align="L")
+            for l_idx, linea_txt in enumerate(lineas_celda):
+                pdf.set_xy(x + padding, y_start + padding + l_idx * line_h)
+                pdf.cell(texto_width, line_h, linea_txt, border=0, align="L")
         pdf.set_xy(x_start, y_start + row_h)
 
     pdf.set_font("Helvetica", "", 10.5)
     pdf.ln(2)
+
+
+def _safe_paragraph(pdf: "FPDF", h: float, texto: str, w: float = None):
+    """Escribe un párrafo partiéndolo en líneas con _wrap_lines y
+    dibujándolas con cell() (no multi_cell()), para no depender del
+    wrapping interno de fpdf2 que puede lanzar 'Not enough horizontal
+    space to render a single character'."""
+    ancho = w if w else (pdf.w - pdf.l_margin - pdf.r_margin)
+    for linea in _wrap_lines(pdf, ancho, texto):
+        pdf.set_x(pdf.l_margin)
+        pdf.cell(ancho, h, linea)
+        pdf.ln(h)
 
 
 def generar_pdf_analisis(texto_ia: str) -> bytes:
@@ -808,7 +817,7 @@ def generar_pdf_analisis(texto_ia: str) -> bytes:
     pdf.add_page()
 
     pdf.set_font("Helvetica", "B", 16)
-    pdf.multi_cell(0, 9, _pdf_sanitize("Analisis Integral de la Flota Vehicular - PESV"))
+    _safe_paragraph(pdf, 9, _pdf_sanitize("Analisis Integral de la Flota Vehicular - PESV"))
     pdf.set_font("Helvetica", "", 10)
     pdf.set_text_color(90, 90, 90)
     meta = (
@@ -816,7 +825,7 @@ def generar_pdf_analisis(texto_ia: str) -> bytes:
         f"Periodo: {date_start} a {date_end}  |  Fuente: {source_label}  |  "
         f"Vehiculos: {n_vehicles}/{len(all_placas)}  |  Modelo IA: {GROQ_MODEL} (Groq)"
     )
-    pdf.multi_cell(0, 6, _pdf_sanitize(meta))
+    _safe_paragraph(pdf, 6, _pdf_sanitize(meta))
     pdf.set_text_color(0, 0, 0)
     pdf.ln(3)
 
@@ -844,18 +853,18 @@ def generar_pdf_analisis(texto_ia: str) -> bytes:
         if linea_limpia.startswith("## "):
             pdf.set_font("Helvetica", "B", 13)
             pdf.ln(2)
-            pdf.multi_cell(0, 8, linea_limpia.replace("## ", ""))
+            _safe_paragraph(pdf, 8, linea_limpia.replace("## ", ""))
             pdf.set_font("Helvetica", "", 10.5)
         elif linea_limpia.startswith("# "):
             pdf.set_font("Helvetica", "B", 14)
-            pdf.multi_cell(0, 8, linea_limpia.replace("# ", ""))
+            _safe_paragraph(pdf, 8, linea_limpia.replace("# ", ""))
             pdf.set_font("Helvetica", "", 10.5)
         elif linea_limpia.startswith(("- ", "* ")):
             pdf.set_font("Helvetica", "", 10.5)
-            pdf.multi_cell(0, 6, "  -  " + linea_limpia[2:].replace("**", ""))
+            _safe_paragraph(pdf, 6, "  -  " + linea_limpia[2:].replace("**", ""))
         else:
             pdf.set_font("Helvetica", "", 10.5)
-            pdf.multi_cell(0, 6, linea_limpia.replace("**", ""))
+            _safe_paragraph(pdf, 6, linea_limpia.replace("**", ""))
         i += 1
 
     return bytes(pdf.output())

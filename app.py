@@ -696,29 +696,105 @@ def _es_separador_tabla(linea: str) -> bool:
     return bool(_TABLE_SEP_RE.match(linea.strip()))
 
 
+def _wrap_lines(pdf: "FPDF", width: float, line_h: float, texto: str):
+    """Devuelve las líneas en que se partiría 'texto' dentro de un ancho
+    dado, sin dibujar nada (para calcular la altura de fila antes de
+    pintarla). Compatible con varias versiones de fpdf2."""
+    texto = texto if texto else ""
+    try:
+        lineas = pdf.multi_cell(width, line_h, texto, dry_run=True, output="LINES")
+        if lineas:
+            return lineas
+    except TypeError:
+        pass
+    try:
+        lineas = pdf.multi_cell(width, line_h, texto, split_only=True)
+        if lineas:
+            return lineas
+    except TypeError:
+        pass
+    # Fallback simple si ninguna de las dos APIs anteriores está disponible
+    aprox_chars = max(1, int(width / 1.8))
+    if len(texto) <= aprox_chars:
+        return [texto]
+    palabras = texto.split(" ")
+    lineas, actual = [], ""
+    for palabra in palabras:
+        candidata = (actual + " " + palabra).strip()
+        if len(candidata) > aprox_chars and actual:
+            lineas.append(actual)
+            actual = palabra
+        else:
+            actual = candidata
+    if actual:
+        lineas.append(actual)
+    return lineas or [""]
+
+
 def _render_tabla_pdf(pdf: "FPDF", filas: list):
-    """Dibuja una tabla markdown ya parseada usando la API de tablas de
-    fpdf2, con estilo simple compatible con el resto del documento."""
+    """Dibuja una tabla markdown ya parseada como un grid manual (anchos
+    de columna fijos, calculados por nosotros), evitando el algoritmo
+    automático de fpdf2 que puede fallar con 'Not enough horizontal
+    space' cuando hay muchas columnas o texto largo sin espacios."""
     if not filas:
         return
+
     n_cols = max(len(f) for f in filas)
+    if n_cols == 0:
+        return
     filas = [f + [""] * (n_cols - len(f)) for f in filas]
     filas = [[_pdf_sanitize(c) for c in f] for f in filas]
 
-    pdf.set_font("Helvetica", "", 9.5)
+    # Máximo de columnas soportadas cómodamente en A4; si el modelo
+    # devolvió más, se fusionan las columnas sobrantes en la última.
+    MAX_COLS = 5
+    if n_cols > MAX_COLS:
+        nuevas_filas = []
+        for f in filas:
+            cabeza = f[:MAX_COLS - 1]
+            resto = " / ".join(c for c in f[MAX_COLS - 1:] if c)
+            nuevas_filas.append(cabeza + [resto])
+        filas = nuevas_filas
+        n_cols = MAX_COLS
+
+    usable_width = pdf.w - pdf.l_margin - pdf.r_margin
+    col_width = usable_width / n_cols
+    line_h = 5.0
+    font_size = 9.0 if col_width >= 22 else 7.5
+    padding = 1.2
+
     pdf.ln(1)
-    with pdf.table(
-        borders_layout="ALL",
-        cell_fill_color=(240, 243, 250),
-        cell_fill_mode="ROWS",
-        text_align="LEFT",
-        line_height=5.5,
-        first_row_as_headings=True,
-    ) as table:
-        for i, fila in enumerate(filas):
-            row = table.row()
-            for celda in fila:
-                row.cell(celda)
+    for idx, fila in enumerate(filas):
+        es_encabezado = idx == 0
+        pdf.set_font("Helvetica", "B" if es_encabezado else "", font_size)
+        if es_encabezado:
+            pdf.set_fill_color(222, 231, 250)
+        elif idx % 2 == 0:
+            pdf.set_fill_color(246, 248, 252)
+        else:
+            pdf.set_fill_color(255, 255, 255)
+
+        # Altura necesaria para la fila (según la celda que más se ajuste)
+        alturas = []
+        for texto in fila:
+            lineas_wrap = _wrap_lines(pdf, col_width - 2 * padding, line_h, texto)
+            alturas.append(max(1, len(lineas_wrap)))
+        row_h = max(alturas) * line_h + 2 * padding
+
+        # Salto de página manual si la fila no cabe en el espacio restante
+        if pdf.get_y() + row_h > pdf.page_break_trigger:
+            pdf.add_page()
+
+        x_start = pdf.l_margin
+        y_start = pdf.get_y()
+
+        for c_idx, texto in enumerate(fila):
+            x = x_start + c_idx * col_width
+            pdf.rect(x, y_start, col_width, row_h, style="DF")
+            pdf.set_xy(x + padding, y_start + padding)
+            pdf.multi_cell(col_width - 2 * padding, line_h, texto, border=0, align="L")
+        pdf.set_xy(x_start, y_start + row_h)
+
     pdf.set_font("Helvetica", "", 10.5)
     pdf.ln(2)
 

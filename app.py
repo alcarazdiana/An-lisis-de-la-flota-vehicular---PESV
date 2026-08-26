@@ -30,6 +30,7 @@ Cómo correrlo en Google Colab:
 
 import io
 import os
+import re
 from datetime import date, datetime
 
 import numpy as np
@@ -638,7 +639,13 @@ def generar_analisis_ia(contexto: str) -> str:
         "markdown (##): Resumen ejecutivo, Seguridad vial, Eficiencia y "
         "combustible, Huella de carbono, Riesgos y vehículos a priorizar, "
         "Recomendaciones. No inventes datos que no estén en el contexto; "
-        "basa tus conclusiones únicamente en las cifras entregadas."
+        "basa tus conclusiones únicamente en las cifras entregadas. "
+        "Cuando presentes datos tabulares (por ejemplo rankings de "
+        "vehículos), usa SIEMPRE tablas en formato markdown estándar "
+        "(filas con '|' y una fila separadora '---' bajo el encabezado), "
+        "con un máximo de 4 columnas y textos de celda cortos, para que "
+        "se puedan renderizar bien en un PDF. No uses tablas anidadas ni "
+        "celdas combinadas."
     )
     completion = client.chat.completions.create(
         model=GROQ_MODEL,
@@ -667,8 +674,59 @@ def _pdf_sanitize(texto: str) -> str:
     return texto.encode("latin-1", "replace").decode("latin-1")
 
 
+_TABLE_ROW_RE = re.compile(r"^\|.*\|$")
+_TABLE_SEP_RE = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?$")
+
+
+def _parse_table_row(linea: str):
+    """Convierte una fila markdown '| a | b | c |' en una lista de celdas."""
+    linea = linea.strip()
+    if linea.startswith("|"):
+        linea = linea[1:]
+    if linea.endswith("|"):
+        linea = linea[:-1]
+    return [c.strip().replace("**", "") for c in linea.split("|")]
+
+
+def _es_fila_tabla(linea: str) -> bool:
+    return bool(_TABLE_ROW_RE.match(linea.strip()))
+
+
+def _es_separador_tabla(linea: str) -> bool:
+    return bool(_TABLE_SEP_RE.match(linea.strip()))
+
+
+def _render_tabla_pdf(pdf: "FPDF", filas: list):
+    """Dibuja una tabla markdown ya parseada usando la API de tablas de
+    fpdf2, con estilo simple compatible con el resto del documento."""
+    if not filas:
+        return
+    n_cols = max(len(f) for f in filas)
+    filas = [f + [""] * (n_cols - len(f)) for f in filas]
+    filas = [[_pdf_sanitize(c) for c in f] for f in filas]
+
+    pdf.set_font("Helvetica", "", 9.5)
+    pdf.ln(1)
+    with pdf.table(
+        borders_layout="ALL",
+        cell_fill_color=(240, 243, 250),
+        cell_fill_mode="ROWS",
+        text_align="LEFT",
+        line_height=5.5,
+        first_row_as_headings=True,
+    ) as table:
+        for i, fila in enumerate(filas):
+            row = table.row()
+            for celda in fila:
+                row.cell(celda)
+    pdf.set_font("Helvetica", "", 10.5)
+    pdf.ln(2)
+
+
 def generar_pdf_analisis(texto_ia: str) -> bytes:
-    """Genera un PDF descargable con el análisis generado por la IA."""
+    """Genera un PDF descargable con el análisis generado por la IA,
+    incluyendo el renderizado correcto de tablas markdown como tablas
+    reales en el PDF (no como texto plano con '|')."""
     pdf = FPDF(format="A4")
     pdf.set_auto_page_break(auto=True, margin=18)
     pdf.add_page()
@@ -686,10 +744,26 @@ def generar_pdf_analisis(texto_ia: str) -> bytes:
     pdf.set_text_color(0, 0, 0)
     pdf.ln(3)
 
-    for linea in texto_ia.splitlines():
-        linea_limpia = _pdf_sanitize(linea).strip()
+    lineas = texto_ia.splitlines()
+    i = 0
+    while i < len(lineas):
+        linea = lineas[i].strip()
+
+        # --- Bloque de tabla markdown: '| a | b |' seguido de '|---|---|' ---
+        if _es_fila_tabla(linea) and i + 1 < len(lineas) and _es_separador_tabla(lineas[i + 1]):
+            filas_tabla = [_parse_table_row(linea)]
+            j = i + 2
+            while j < len(lineas) and _es_fila_tabla(lineas[j].strip()):
+                filas_tabla.append(_parse_table_row(lineas[j]))
+                j += 1
+            _render_tabla_pdf(pdf, filas_tabla)
+            i = j
+            continue
+
+        linea_limpia = _pdf_sanitize(linea)
         if not linea_limpia:
             pdf.ln(3)
+            i += 1
             continue
         if linea_limpia.startswith("## "):
             pdf.set_font("Helvetica", "B", 13)
@@ -706,6 +780,7 @@ def generar_pdf_analisis(texto_ia: str) -> bytes:
         else:
             pdf.set_font("Helvetica", "", 10.5)
             pdf.multi_cell(0, 6, linea_limpia.replace("**", ""))
+        i += 1
 
     return bytes(pdf.output())
 
